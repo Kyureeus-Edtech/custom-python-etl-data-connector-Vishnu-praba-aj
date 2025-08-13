@@ -48,7 +48,7 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```env
-MONGODB_URI=mongodb://localhost:27017
+MONGODB_URI= Host URI
 MONGODB_DB= DB name
 MONGODB_COLLECTION= Collection Name
 DSHIELD_BASE_URL=https://www.dshield.org/api
