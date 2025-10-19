@@ -1,151 +1,127 @@
-# DShield ETL Connector - Top IPs + IP Info
+# RDAP ETL Pipeline  
 
-## 📌 Overview
-This Python script extracts the **top attacking IP addresses** from the [DShield REST API](https://www.dshield.org/api/), retrieves detailed IP information, transforms the data, and loads it into a MongoDB database.
-
-It is designed as an ETL (Extract-Transform-Load) pipeline for cybersecurity data analysis.
+An ETL (Extract–Transform–Load) pipeline that fetches RDAP (Registration Data Access Protocol) data for **domains, IP addresses, and ASNs**, transforms it into a simplified format, and stores it in **MongoDB** for further analysis.  
 
 ---
 
-## ⚙️ Features
-- **Extract**: Fetches top attacking IPs from DShield.
-- **Transform**: Enriches each IP with detailed information from DShield's IP Info API.
-- **Load**: Saves the transformed data into a MongoDB collection.
-- **Logging**: Prints before/after transformation samples.
-- **Error handling**: Handles rate limiting, network errors, and MongoDB insertion failures.
+## 📖 Overview  
+
+This project demonstrates a complete ETL process using Python:  
+- **Extract:** Fetch RDAP data from `rdap.org` API for domains, IPs, and ASNs.  
+- **Transform:** Normalize and extract useful fields (e.g., handle, status, entities, nameservers).  
+- **Load:** Store cleaned data into MongoDB collections for easy querying.  
+- **Validation:** Built-in pipeline tests handle invalid inputs, API errors, and empty responses.  
 
 ---
 
-## 🔌 Requirements
-- Python **3.9+**
-- MongoDB (local or cloud)
-- DShield API access (no authentication required, but rate limits apply)
+## ✨ Features  
+
+- Fetch RDAP data for **Domains, IPs, and ASNs**.  
+- Automatic **retry and backoff** on API rate limits or network errors.  
+- **Data transformation** (flattened entities, trimmed keys).  
+- **MongoDB storage** with separate collections (`rdap_domain_raw`, `rdap_ip_raw`, `rdap_asn_raw`).  
+- Validation tests for:  
+  - Invalid/edge-case inputs  
+  - Empty responses  
+  - MongoDB insertion checks  
+- Example outputs displayed for clarity (one per type).  
 
 ---
 
-## 📂 Installation
+## ⚙️ Requirements  
 
-1. **Clone the repository**
-```bash
-git clone https://github.com/Kyureeus-Edtech/custom-python-etl-data-connector-Vishnu-praba-aj.git
-```
-
-2. **Create and activate a virtual environment**
-```bash
-python -m venv venv
-source venv/bin/activate   # macOS/Linux
-venv\Scripts\activate      # Windows
-```
-
-3. **Install dependencies**
-```bash
-pip install -r requirements.txt
-```
+- Python 3.8+  
+- MongoDB (local or cloud instance)  
+- Dependencies (installed via `pip`):  
+  - `requests`  
+  - `pymongo`  
+  - `python-dotenv`  
 
 ---
 
-## Environment Variables
-Create a `.env` file in the project root:
+## 📦 Installation  
+
+1. Clone the repository:  
+   ```bash
+   git clone https://github.com/yourusername/rdap-etl-pipeline.git
+   cd rdap-etl-pipeline
+   ```
+
+2. Create a virtual environment and activate it:  
+   ```bash
+   python -m venv venv
+   source venv/bin/activate   # On macOS/Linux
+   venv\Scripts\activate      # On Windows
+   ```
+
+3. Install dependencies:  
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+---
+
+## 🔑 Environment Variables  
+
+Create a `.env` file in the project root:  
 
 ```env
-MONGODB_URI= Host URI
-MONGODB_DB= DB name
-MONGODB_COLLECTION= Collection Name
-DSHIELD_BASE_URL=https://www.dshield.org/api
-USER_AGENT_EMAIL=youremail@example.com
+MONGO_URI=mongodb://localhost:27017/
+DB_NAME=rdap_db
 ```
+
+Defaults are used if not provided:  
+- `MONGO_URI` → `<MONGO DB URI>`
+- `DB_NAME` → `DB name` 
+must be set in `.env`  
 
 ---
 
+## 🚀 Usage  
 
-## Usage
-Run the ETL connector:
+Run the ETL pipeline:  
 ```bash
 python etl_connector.py
 ```
 
-**What it does:**
-1. Pings MongoDB to check connectivity.
-2. Fetches the **Top IPs** list from DShield.
-3. For each IP, fetches **detailed IP info**.
-4. Combines the two datasets.
-5. Saves them into MongoDB.
+This will:  
+1. Fetch RDAP data for sample domains, IPs, and ASNs.  
+2. Transform and display one sample record per type.  
+3. Insert all records into MongoDB.  
+4. Run validation tests.  
 
 ---
 
-## DShield API Endpoints Used
+## 🌐 API Endpoints Used  
 
-### 1. **Top IPs**
-* **Endpoint**: `/topips`  
-* **Example URL**:
-```
-https://www.dshield.org/api/topips?json
-```
-* **Response Example**:
-```json
-{
-  "topips": [
-    {
-      "rank": 1,
-      "source": "13.94.254.200",
-      "reports": 319739,
-      "targets": 1
-    },
-    {
-      "rank": 2,
-      "source": "194.224.249.214",
-      "reports": 309508,
-      "targets": 1
-    }
-  ]
-}
-```
-
-### 2. **IP Info**
-* **Endpoint**: `/ip/{ip}`  
-* **Example URL**:
-```
-https://www.dshield.org/api/ip/13.94.254.200?json
-```
-* **Response Example**:
-```json
-{
-  "ip": {
-    "number": "13.94.254.200",
-    "asn": "AS8075",
-    "country": "US",
-    "attacks": 1023
-  }
-}
-```
+Data is fetched from **[RDAP.org](https://rdap.org/)**:  
+- Domain: `https://rdap.org/domain/{domain}`  
+- IP: `https://rdap.org/ip/{ip}`  
+- ASN: `https://rdap.org/autnum/{asn}`  
 
 ---
 
+## 📝 Example Output 
+Raw ASN data:
 
-## Example Log Output
-Output before transform:
+[![Raw](output_images/raw_asn_data.png)](output_images/raw_asn_data.png)
 
-[![output-before transform](output_images/output_before_transform.png)](output_images/output_before_transform.png)
+Transformed ASN data:  
+[![transformed](output_images/transformed_asn_data.png)](output_images/transformed_asn_data.png)
 
-Output after transform:  
-[![output-after transform](output_images/output_after_transform.png)](output_images/output_after_transform.png)
+MongoDB collections:
+[![mongo](output_images/mongo_collections.png)](output_images/mongo_collections.png)
 
-[![output log](output_images/output_log.png)](output_images/output_log.png)
-
----
-
-## MongoDB Output Example
-[![mongodb load](output_images/mongodb_output.png)](output_images/mongodb_output.png)
+MongoDB data Load:
+[![mongo](output_images/mongo_data.png)](output_images/mongo_data.png)
 
 
 ---
 
-## Notes
-* The DShield API enforces **rate limits** (HTTP 429). The script will retry automatically.
-* If MongoDB is remote, ensure the connection string and firewall rules are correct.
+## 📜 License  
+
+This project is licensed under the **MIT License** – you are free to use, modify, and distribute it.  
 
 ---
 
-## License
-MIT License.  
-Data provided by [DShield.org](https://www.dshield.org/).
+ 

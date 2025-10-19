@@ -1,171 +1,226 @@
-#!/usr/bin/env python3
-"""
-DShield ETL Connector - topips + ipinfo
-----------------------------------------
-Extracts the top attacking IPs from DShield's REST API, retrieves detailed info for each,
-transforms it, and loads into MongoDB.
-"""
-
 import os
-import sys
 import time
+import requests
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from datetime import datetime
+from pymongo import MongoClient
+from dotenv import load_dotenv
 import json
 
-import requests
-from dotenv import load_dotenv
-from pymongo import MongoClient, errors as pymongo_errors
+# Load environment variables
 
-# Config & Setup
 load_dotenv()
 
-BASE_URL = os.getenv("DSHIELD_BASE_URL", "https://www.dshield.org/api")
-COLLECTION_NAME = os.getenv("MONGODB_COLLECTION") 
-SESSION = requests.Session()
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+DB_NAME = os.getenv("DB_NAME")
+
+DOMAIN_QUERIES = ["ssn.edu.in", "google.com"]
+IP_QUERIES = ["8.8.8.8", "1.1.1.1"]
+ASN_QUERIES = ["15169", "13335"]
+
+
+# Logging setup
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("dshield_topips_raw")
 
 
-def get_headers() -> Dict[str, str]:
-    ua_email = os.getenv("USER_AGENT_EMAIL") 
-    return {
-        "User-Agent": f"SSN-CSE-ETL/1.0 (+{ua_email})",
-        "Accept": "application/json",
+# MongoDB setup
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collections = {
+    "domain": db["rdap_domain_raw"],
+    "ip": db["rdap_ip_raw"],
+    "asn": db["rdap_asn_raw"]
+}
+
+
+# Extract Function
+
+def fetch_rdap(endpoint_type, query):
+    """Fetch data from RDAP API with retries"""
+    url = f"https://rdap.org/{endpoint_type}/{query.strip()}"
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                return response.json(), url
+            elif response.status_code == 429:
+                logging.warning("Rate limit hit. Retrying...")
+                time.sleep(2 ** attempt)
+            else:
+                logging.error(f"{endpoint_type} {query}: Error {response.status_code}")
+                return None, url
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            time.sleep(2 ** attempt)
+    return None, url
+
+
+# Transform Function
+
+def transform_rdap(data, source_type, api_url):
+    """Extract minimal but useful fields from RDAP response"""
+    if not data:
+        return None
+
+    # Flattened entities (just  name, email, roles)
+    entities = []
+    for ent in data.get("entities", []):
+        ent_data = {}
+        vcard = ent.get("vcardArray")
+        if vcard and len(vcard) > 1:
+            for field in vcard[1]:
+                if field[0] == "fn":
+                    ent_data["name"] = field[3]
+                elif field[0] == "email":
+                    ent_data["email"] = field[3]
+                elif field[0] == "org":
+                    ent_data["organization"] = field[3]
+        if ent.get("roles"):
+            ent_data["roles"] = ent.get("roles")
+        if ent_data:  # only add non-empty
+            entities.append(ent_data)
+
+    
+    record = {
+        "handle": data.get("handle"),
+        "status": data.get("status"),
+        "name": data.get("name") or data.get("ldhName"),
+        "entities": entities[:3],  # only keep first 3 entities to avoid bloat
+        "_type": source_type,
+        "_url": api_url,
+        "_at": datetime.utcnow().isoformat()
     }
 
+    # Add type-specific essentials
+    if source_type == "domain":
+        record["nameservers"] = [ns.get("ldhName") for ns in data.get("nameservers", [])[:3]]
+    elif source_type == "ip":
+        record["range"] = f"{data.get('startAddress')} - {data.get('endAddress')}"
+        record["version"] = data.get("ipVersion")
+    elif source_type == "asn":
+        record["asn_range"] = f"{data.get('startAutnum')} - {data.get('endAutnum')}"
 
-def with_json(url: str) -> str:
-    return f"{url}{'&' if '?' in url else '?'}json"
+    # Drop keys with None or empty lists
+    record = {k: v for k, v in record.items() if v not in [None, [], ""]}
 
-
-def http_get(path: str, max_retries: int = 3) -> Tuple[int, Any]:
-    url = with_json(f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}")
-    attempt = 0
-    while True:
-        attempt += 1
-        resp = SESSION.get(url, headers=get_headers(), timeout=30)
-        if resp.status_code == 429:
-            wait_s = int(resp.headers.get("Retry-After", "300"))
-            logger.warning("Rate-limited: sleeping %ss", wait_s)
-            if attempt >= max_retries:
-                break
-            time.sleep(wait_s)
-            continue
-        if 200 <= resp.status_code < 300:
-            try:
-                return resp.status_code, resp.json()
-            except Exception:
-                return resp.status_code, resp.text
-        else:
-            logger.error("HTTP %s from %s", resp.status_code, url)
-            if attempt >= max_retries:
-                break
-            time.sleep(min(2**attempt, 10))
-    return resp.status_code, None
+    return record
 
 
-# Mongo connection
-def get_mongo() -> Tuple[MongoClient, str]:
-    mongodb_uri = os.getenv("MONGODB_URI")
-    db_name = os.getenv("MONGODB_DB")
-    client = MongoClient(mongodb_uri)
-    return client, db_name
+# Load Function
 
+def load_to_mongo(records, source_type):
+    """Insert multiple records into MongoDB"""
+    if records:
+        collections[source_type].insert_many(records)
+        logging.info(f"Inserted {len(records)} records into {source_type} collection")
 
-def load_to_mongo(rows: List[Dict[str, Any]], collection_name: str) -> int:
-    if not rows:
-        logger.info("No rows to insert into %s", collection_name)
-        return 0
-    client, db_name = get_mongo()
-    try:
-        coll = client[db_name][collection_name]
-        coll.create_index("_ingested_at")
-        result = coll.insert_many(rows, ordered=False)
-        count = len(result.inserted_ids)
-        logger.info("Inserted %s docs into %s.%s", count, db_name, collection_name)
-        return count
-    except pymongo_errors.PyMongoError as e:
-        logger.exception("MongoDB insert failed: %s", e)
-        return 0
-    finally:
-        client.close()
+        # Show first inserted record
+        sample = collections[source_type].find_one(sort=[("_id", -1)])
+        #print(f"\n📥 Sample loaded {source_type} record in MongoDB:")
+        #print(json.dumps(sample, indent=2, default=str))
 
-
-# Transform function
-def transform_topips_with_details(topips_payload: Any) -> List[Dict[str, Any]]:
-    now = datetime.now(timezone.utc)
-    results = []
-    ip_list = topips_payload.get("topips", []) if isinstance(topips_payload, dict) else []
-    for ip_entry in ip_list:
-        ip_addr = ip_entry.get("ip") or ip_entry.get("source")
-        if not ip_addr:
-            continue
-
-        # Fetch IP details
-        code, ip_details = http_get(f"ip/{ip_addr}")
-        if code != 200 or not isinstance(ip_details, dict):
-            logger.warning("No details for IP %s", ip_addr)
-            continue
-
-        # Merge IP rank info + details
-        merged = {
-            "ip": ip_addr,
-            "rank_info": ip_entry,
-            "ip_details": ip_details.get("ip", ip_details),
-            "_ingested_at": now,
-            "_source": "dshield:topips+ipinfo"
-        }
-        results.append(merged)
-    return results
-
-
-def main() -> int:
-    # Early Test Mongo
-    try:
-        client, db = get_mongo()
-        client[db].command("ping")
-        client.close()
-        logger.info("MongoDB ping OK (db=%s)", db)
-    except Exception as e:
-        logger.error("MongoDB connection failed: %s", e)
-        return 2
-
-    # Fetch topips
-    code, payload = http_get("topips")
-    if code != 200:
-        logger.error("topips fetch failed: HTTP %s", code)
-        return 1
-
-    # Normalize payload so we can sample it
-    if isinstance(payload, dict) and "topips" in payload:
-        sample_before = payload["topips"][:3]
-    elif isinstance(payload, list):
-        sample_before = payload[:3]
-        payload = {"topips": payload}
     else:
-        sample_before = [payload]
-        payload = {"topips": [payload]}
-
-    logger.info("Sample BEFORE transform (topips):\n%s",
-                json.dumps(sample_before, indent=2, default=str))
-
-    # After transform
-    enriched_rows = transform_topips_with_details(payload)
-    logger.info("Sample AFTER transform:\n%s",
-                json.dumps(enriched_rows[:2], indent=2, default=str))
-
-    # Load into Mongo
-    inserted = load_to_mongo(enriched_rows, COLLECTION_NAME)
-    logger.info("Done. Inserted %s documents.", inserted)
-    return 0
+        logging.warning(f"No valid records to insert for {source_type}")
 
 
+# ETL Runner
+
+def run_etl():
+    logging.info("Starting RDAP ETL pipeline...")
+
+    domain_records, ip_records, asn_records = [], [], []
+
+    # Domain ETL
+    for i, d in enumerate(DOMAIN_QUERIES):
+        raw, url = fetch_rdap("domain", d)
+        if raw and i == 0:  # print only first domain fetched
+            print("\nRaw Fetched Domain Data:")
+            print(json.dumps({k: raw[k] for k in list(raw.keys())[:5]}, indent=2))
+
+        record = transform_rdap(raw, "domain", url)
+        if record:
+            if i == 0:  # print only first transformed domain
+                print("\nTransformed Domain Data:")
+                print(json.dumps(record, indent=2, default=str))
+            domain_records.append(record)
+
+    # IP ETL
+    for i, ip in enumerate(IP_QUERIES):
+        raw, url = fetch_rdap("ip", ip)
+        if raw and i == 0:
+            print("\nRaw Fetched IP Data:")
+            print(json.dumps({k: raw[k] for k in list(raw.keys())[:5]}, indent=2))
+
+        record = transform_rdap(raw, "ip", url)
+        if record:
+            if i == 0:
+                print("\nTransformed IP Data:")
+                print(json.dumps(record, indent=2, default=str))
+            ip_records.append(record)
+
+    # ASN ETL
+    for i, asn in enumerate(ASN_QUERIES):
+        raw, url = fetch_rdap("autnum", asn)
+        if raw and i == 0:
+            print("\nRaw Fetched ASN Data:")
+            print(json.dumps({k: raw[k] for k in list(raw.keys())[:5]}, indent=2))
+
+        record = transform_rdap(raw, "asn", url)
+        if record:
+            if i == 0:
+                print("\nTransformed ASN Data:")
+                print(json.dumps(record, indent=2, default=str))
+            asn_records.append(record)
+
+    # Load all data and show one sample per collection
+    load_to_mongo(domain_records, "domain")
+    load_to_mongo(ip_records, "ip")
+    load_to_mongo(asn_records, "asn")
+
+    logging.info("RDAP ETL pipeline finished ")
+
+# -----------------------
+# Validation & Testing
+# -----------------------
+def validate_pipeline():
+    logging.info("Running validation tests...")
+
+    # Invalid domain
+    raw, url = fetch_rdap("domain", "notarealdomain.abcxyz")
+    assert raw is None, "Invalid domain should return None"
+
+    # Invalid IP
+    raw, url = fetch_rdap("ip", "999.999.999.999")
+    assert raw is None, "Invalid IP should return None"
+
+    # Invalid ASN
+    raw, url = fetch_rdap("autnum", "999999999999")
+    assert raw is None, "Invalid ASN should return None"
+
+    # Empty data handling
+    transformed = transform_rdap({}, "domain", "test_url")
+    assert transformed is None, "Empty JSON should not be transformed"
+
+    # Check Mongo insertions
+    count_domain = collections["domain"].count_documents({})
+    count_ip = collections["ip"].count_documents({})
+    count_asn = collections["asn"].count_documents({})
+
+    assert count_domain >= 0, "Domain collection should exist"
+    assert count_ip >= 0, "IP collection should exist"
+    assert count_asn >= 0, "ASN collection should exist"
+
+    logging.info("All validation tests passed")
+
+# -----------------------
+# Main
+# -----------------------
 if __name__ == "__main__":
-    sys.exit(main())
+    run_etl()
+    validate_pipeline()
